@@ -1,8 +1,8 @@
-# Reliability Engineering Dataset Generator
+# Reliability engineering dataset generator
 
-A three-stage pipeline for extracting, augmenting, and solving reliability engineering exercises from OCR-processed textbooks.
+A three-stage pipeline for extracting, augmenting and solving reliability engineering exercises from OCR-processed textbooks.
 
-## Pipeline Stages
+## Pipeline stages
 
 1. **Extract**: Identify exercises from textbook chunks using GPT-4o-mini
 2. **Augment**: Rewrite questions to be self-contained and standalone
@@ -18,7 +18,7 @@ A three-stage pipeline for extracting, augmenting, and solving reliability engin
 
 ## Configuration
 
-Edit the following variables in `new5.py`:
+Edit the following variables in `main.py`:
 
 ```python
 OPENROUTER_API_KEY = "your-api-key"
