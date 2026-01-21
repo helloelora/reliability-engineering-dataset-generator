@@ -1,397 +1,357 @@
-"""
-Reliability Engineering dataset generator
-
-A three-stage pipeline for extracting, augmenting and solving 
-reliability engineering exercises from OCR-processed textbooks.
-
-Pipeline stages:
-1. Extract: Identify exercises from textbook chunks
-2. Augment: Rewrite questions to be self-contained
-3. Solve: Generate step-by-step reasoning with verification
-"""
-
 import os
 import json
 import re
-import glob
-import time
 import threading
+import time
 import random
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from openai import OpenAI
-from typing import List, Dict, Any, Optional
-
+from typing import Dict, List, Optional
 
 # Configuration
-OPENROUTER_API_KEY = ""
-OUTPUT_FILE = "dataset_reliability_augmented.jsonl" 
-REJECTED_FILE = "dataset_rejected.jsonl"
+OPENROUTER_API_KEY = os.getenv("OPENROUTER_API_KEY", "")
+if not OPENROUTER_API_KEY:
+    raise ValueError("OPENROUTER_API_KEY environment variable is not set.")
+INPUT_FILE = "Textbook exercices/Reliability.md"
+OUTPUT_FILE = "dataset_reliability_verified.jsonl"
+REJECTED_FILE = "dataset_rejected_debug.jsonl"
 
-MAX_WORKERS = 5
-TEXTBOOKS_FOLDER = "reliability books ocr/mistral ocr" 
+# Parameters
+MAX_WORKERS = 10  # Adjust based on your rate limit
+MODEL_REASON = "deepseek/deepseek-r1-distill-llama-70b"  # Model optimized for math and reasoning tasks
 
-MODEL_EXTRACT = "openai/gpt-4o-mini"            
-MODEL_AUGMENT = "openai/gpt-4o-mini"            
-MODEL_REASON = "deepseek/deepseek-r1-distill-llama-70b" 
-
-global_stats = {
-    "total_cost": 0.0,
-    "saved_items": 0,
-    "rejected_items": 0,
-    "api_errors": 0
-}
-stats_lock = threading.Lock()
-file_lock = threading.Lock()
-
+# Client API
 client = OpenAI(
     base_url="https://openrouter.ai/api/v1",
     api_key=OPENROUTER_API_KEY
 )
 
+# Thread-safe locks for writing and statistics
+stats_lock = threading.Lock()
+file_lock = threading.Lock()
 
-EXTRACT_PROMPT = """
-You are a strict data extraction specialist for Reliability Engineering textbooks.
-RULES:
-1. **Identify Exercises**: Look for "Example", "Problem", "Exercise", "Question".
-2. **SEPARATE STRICTLY**:
-   - `question_clean`: The problem statement ONLY. Remove answers/hints.
-   - `final_answer`: The final result found in the text.
-   - `provided_reasoning`: The step-by-step solution from the text (OCR). If none, null.
-3. **Output JSON**: {"exercises": [{"source_id": "...", "question_clean": "...", "final_answer": "...", "provided_reasoning": "..."}]}
-"""
+global_stats = {
+    "processed": 0,
+    "rejected_syntax": 0,
+    "rejected_discrepancy": 0,
+    "cost": 0.0
+}
 
-AUGMENT_PROMPT = """
-You are a Textbook Editor. Your goal is to rewrite an exercise to make it completely STANDALONE and SELF-CONTAINED.
 
-Input Data:
-- **Draft Question**: {q}
-- **Context/Snippet**: "{context}"
+REASONING_PROMPT = """
+You are a Reliability Engineering Professor. 
+You are provided with a Question and its official Target Answer from a textbook.
 
-TASKS:
-1. **Check for Missing Data**: If the question relies on a Table, Figure, Chart, or Appendix not explicitly fully described in the text, REJECT IT.
-2. **Inject Parameters**: If the question refers to values found in the context (e.g. "Calculate reliability for the system above"), you MUST rewrite the question to include these values explicitly (e.g. "Calculate reliability for a system with lambda=0.01").
-3. **Cleanup**: Remove references like "As seen in Example 4.1" or "From the previous section".
+**Task**:
+1. Solve the problem step-by-step yourself (derive the math).
+2. **SAFETY CHECK**: Compare your derived result with the provided "Target Answer".
+   - If your result matches the Target Answer (within approx 5% margin): Output the reasoning steps.
+   - If your result CONTRADICTS the Target Answer: Output "DISCREPANCY_FOUND" in the status field.
 
-OUTPUT JSON ONLY:
+**Input Data**:
+- Question: {question}
+- Target Answer: {answer}
+
+**Output Format**:
+Return a valid JSON object ONLY. Do not include the question or answer in the output, only the reasoning and status.
 {{
-   "status": "valid" OR "rejected",
-   "augmented_question": "The fully rewritten, standalone question...",
-   "rejection_reason": "Only if rejected (e.g. Missing Table)"
-}}
-"""
-
-SOLVER_PROMPT = """
-You are a Reliability Engineering Professor. Solve the following problem step-by-step.
-
-**Problem**: 
-{q}
-
-**Target Answer (for verification only)**: 
-{a}
-
-INSTRUCTIONS:
-1. **Derive the solution** step-by-step using standard LaTeX for math.
-2. **Safety Check**: Compare your final result with the Target Answer.
-   - If consistent (approx 5% error margin): Output the reasoning.
-   - If FUNDAMENTALLY different (contradiction): Output "DISCREPANCY_FOUND".
-
-OUTPUT JSON ONLY:
-{{
-   "reasoning": "The step-by-step derivation...",
-   "final_answer_check": "The result you found"
+    "status": "MATCH" or "DISCREPANCY_FOUND",
+    "reasoning": "We start by identifying the distribution... applying the formula... substitution gives...Therefore, the final answer is:..."
 }}
 """
 
 
-def retry_api_call(func):
-    def wrapper(*args, **kwargs):
-        retries = 3
-        base_delay = 2
-        for i in range(retries):
-            try:
-                return func(*args, **kwargs)
-            except Exception as e:
-                error_msg = str(e).lower()
-                if "context length" in error_msg or "too large" in error_msg:
-                    return None
-                if i < retries - 1:
-                    time.sleep(base_delay * (2 ** i) + random.uniform(0, 1))
-                else:
-                    with stats_lock: global_stats["api_errors"] += 1
-                    return None
-    return wrapper
+def remove_captions_and_noise(text: str) -> str:
+    """
+    Cleans text from book structure artifacts:
+    1. Figure and Table captions
+    2. Recurring headers/footers (e.g., "16 *Applied Reliability*")
+    3. Isolated page numbers
+    """
+    header_regex = r'(?:\d+\s+)?(?:[*_]+)?Applied Reliability(?:[*_]+)?(?:\s+\d+)?'
+    
+    lines = text.split('\n')
+    cleaned_lines = []
+    
+    for line in lines:
+        line_stripped = line.strip()
+        if not line_stripped: continue  # Skip empty lines  # Skip empty lines 
+        
+        if re.fullmatch(header_regex, line_stripped, re.IGNORECASE):
+            continue
+
+        if re.match(r'^(?:\*\*)?\s*(?:FIGURE|TABLE)\s+\d+', line_stripped, re.IGNORECASE):
+            continue
+
+        if re.match(r'^\d+$', line_stripped):
+            continue
+            
+        cleaned_lines.append(line)
+
+    cleaned_text = "\n".join(cleaned_lines).strip()
+    # Remove pattern from the very end of text ($)
+    cleaned_text = re.sub(header_regex + r'$', '', cleaned_text, flags=re.IGNORECASE).strip()
+    
+    return cleaned_text
 
 
-def is_tautology(question: str, answer: str) -> bool:
-    q_lower = question.lower()
-    a_clean = str(answer).strip()
-    if len(a_clean) > 3 and a_clean in q_lower:
+def has_cross_reference(text: str) -> bool:
+    """
+    Detects if the question references missing external context.
+    Should be called AFTER `remove_captions_and_noise`.
+    """
+    # Patterns indicating external dependency
+    refs = [
+        r'example\s+\d',           # "Example 5.3"
+        r'exercise\s+\d',          # "Exercise 11.4"
+        r'problem\s+\d',           # "Problem 2"
+        r'section\s+\d',           # "Section 4.2"
+        r'chapter\s+\d',           # "Chapter 3"
+        r'appendix',               # "Appendix A"
+        r'previous\s+(?:problem|exercise|example)', # "previous example"
+        r'data\s+in',              # "data in Example..."
+        r'refer\s+to',             # "Refer to..."
+        r'based\s+on',             # "Based on..."
+        r'shown\s+in',             # "Shown in..."
+        r'from\s+(?:example|exercise|problem)',    # "From Example..."
+    ]
+    
+    text_lower = text.lower()
+    
+    # Special handling: TABLES
+    # If the word "table" is present, check if a Markdown table (|---|) exists.
+    has_table_word = "table" in text_lower
+    has_md_table = bool(re.search(r'\|[\s-]*:?[\s-]{3,}:?[\s-]*\|', text))
+    
+    # If "table" is mentioned but no visual table exists -> Reject
+    if has_table_word and not has_md_table:
+        return True 
+
+    # Special handling: FIGURES
+    # If "figure" remains after caption cleaning, it's a reference in the text -> Reject
+    if "figure" in text_lower:
         return True
+
+    # Check remaining patterns
+    for pattern in refs:
+        if re.search(pattern, text_lower):
+            return True
+            
     return False
 
-def is_context_leak(text: str) -> bool:
-    forbidden = [
-        "refer to the context", "provided in the context", 
-        "as shown in the above", "context snippet"
-    ]
-    t_lower = text.lower()
-    return any(phrase in t_lower for phrase in forbidden)
 
-def is_ghost_question(question: str) -> bool:
-    """Check if question references external elements (tables, figures, etc.)"""
-    ghost_words = [
-        "table", "figure", "chart", "plot", "graph", "shown below", 
-        "refer to", "see above", "appendix", "section", "chapter"
-    ]
-    q_lower = question.lower()
-    return any(word in q_lower for word in ghost_words)
-
-def is_discrepancy(reasoning: str) -> bool:
-    forbidden = ["discrepancy_found", "reject_missing_data", "does not match the target"]
-    r_lower = reasoning.lower()
-    return any(phrase in r_lower for phrase in forbidden)
-
-
-def sanitize_text(text: Any) -> str:
-    if text is None: return ""
-    if isinstance(text, (dict, list)): return str(text)
-    text = str(text)
-    text = text.replace('\u0000', ' infinity ') 
-    text = re.sub(r'(\d),(\d{3})', r'\1\2', text) 
-    text = re.sub(r'\s+', ' ', text)
-    return text.strip()
-
-def fix_latex_artifacts(text: str) -> str:
+def clean_spaces(text: str) -> str:
+    """Final cleanup for JSON (removes double spaces and line breaks)"""
     if not text: return ""
-    replacements = {
-        r'\\text{sqrt}': r'\\sqrt', r'\\text{pi}': r'\\pi',
-        r'\\text{sigma}': r'\\sigma', r'\\text{mu}': r'\\mu',
-        r'\\text{lambda}': r'\\lambda', r'\\text{exp}': r'\\exp', 
-        r'\\text{ln}': r'\\ln', r'\\cdot': r' \\cdot '  
-    }
-    for bad, good in replacements.items():
-        try: text = re.sub(bad, good, text, flags=re.IGNORECASE)
-        except: pass
-    text = re.sub(r'\\text\{([a-zA-Z])\}', r'\1', text)
+    text = text.strip()
+    text = re.sub(r'\s+', ' ', text)
     return text
 
-def parse_json_response(content: str) -> Dict:
+
+def parse_textbook(file_path: str):
+    """Extracts questions and answers from the Markdown file."""
     try:
-        clean_content = re.sub(r'^```json\s*', '', content.strip())
-        clean_content = re.sub(r'\s*```$', '', clean_content)
-        return json.loads(clean_content)
-    except:
-        return None
+        with open(file_path, 'r', encoding='utf-8') as f: content = f.read()
+    except FileNotFoundError:
+        print(f"Error: The file {file_path} was not found.")
+        return [], {}
 
-def update_cost(model_name, usage):
-    if not usage: return
-    prices = {
-        MODEL_EXTRACT: {"input": 0.15, "output": 0.60},
-        MODEL_AUGMENT: {"input": 0.15, "output": 0.60},
-        MODEL_REASON:  {"input": 0.35, "output": 1.40} 
-    }
-    p = prices.get(model_name, {"input": 0, "output": 0})
-    cost = (usage.prompt_tokens/1e6 * p["input"]) + (usage.completion_tokens/1e6 * p["output"])
-    with stats_lock: global_stats["total_cost"] += cost
-
-def save_entry(entry: Dict, accepted: bool):
-    target_file = OUTPUT_FILE if accepted else REJECTED_FILE
-    with file_lock:
-        try:
-            with open(target_file, "a", encoding="utf-8") as f:
-                f.write(json.dumps(entry) + "\n")
-                f.flush()
-                os.fsync(f.fileno())
-            if accepted: global_stats["saved_items"] += 1
-            else: global_stats["rejected_items"] += 1
-            tot = global_stats["saved_items"] + global_stats["rejected_items"]
-            if tot % 5 == 0:
-                print(f"Stats: OK {global_stats['saved_items']} | REJECT {global_stats['rejected_items']} | Cost ${global_stats['total_cost']:.4f}")
-        except Exception as e:
-            print(f"Error saving entry: {e}")
-
-
-def get_sliding_chunks(text: str, chunk_size: int = 12000, overlap: int = 1500) -> List[str]:
-    chunks = []
-    start = 0
-    text_len = len(text)
-    while start < text_len:
-        end = start + chunk_size
-        if end < text_len:
-            search_zone = text[end - 500 : end] 
-            last_newline = search_zone.rfind('\n')
-            if last_newline != -1: end = (end - 500) + last_newline
-        chunks.append(text[start:end])
-        start = end - overlap
-        if start >= text_len or end >= text_len: break
-    return chunks
-
-
-@retry_api_call
-def call_extraction(chunk):
-    return client.chat.completions.create(
-        model=MODEL_EXTRACT,
-        messages=[{"role": "system", "content": EXTRACT_PROMPT}, {"role": "user", "content": chunk}],
-        response_format={"type": "json_object"}, timeout=60
-    )
-
-@retry_api_call
-def call_augmentation(q, context):
-    prompt = AUGMENT_PROMPT.format(q=q, context=context)
-    return client.chat.completions.create(
-        model=MODEL_AUGMENT,
-        messages=[{"role": "user", "content": prompt}],
-        response_format={"type": "json_object"}, timeout=60
-    )
-
-@retry_api_call
-def call_solver(q, a):
-    prompt = SOLVER_PROMPT.format(q=q, a=a)
-    return client.chat.completions.create(
-        model=MODEL_REASON,
-        messages=[{"role": "user", "content": prompt}],
-        response_format={"type": "json_object"}, temperature=0.3, timeout=180
-    )
-
-
-def process_single_file(file_path: str):
-    filename = os.path.basename(file_path)
-    try:
-        with open(file_path, "r", encoding="utf-8") as f: raw_text = f.read()
-        chunks = get_sliding_chunks(raw_text)
-    except: return
-
-    raw_exercises = []
-    for chunk in chunks:
-        completion = call_extraction(chunk)
-        if completion:
-            update_cost(MODEL_EXTRACT, completion.usage)
-            try:
-                content = completion.choices[0].message.content
-                data = parse_json_response(content) 
-                
-                exercises_list = []
-                
-                if isinstance(data, dict):
-                    exercises_list = data.get("exercises", [])
-                    if not exercises_list and "question_clean" in data:
-                        exercises_list = [data]
-
-                elif isinstance(data, list):
-                    exercises_list = data
-                
-                for item in exercises_list:
-                    if isinstance(item, dict) and item.get("question_clean") and item.get("final_answer"):
-                        raw_exercises.append(item)
-                        
-            except Exception:
-                pass
-
-    unique_exercises = []
-    seen = set()
-    for ex in raw_exercises:
-        clean_q = sanitize_text(ex["question_clean"])
-        k = clean_q[:100].replace(" ", "").lower()
-        if k not in seen:
-            unique_exercises.append(ex)
-            seen.add(k)
-
-    if not unique_exercises: return
-    print(f"> {filename}: Found {len(unique_exercises)} candidates. Processing...")
-
-    for i, ex in enumerate(unique_exercises):
-        q_raw = sanitize_text(ex["question_clean"])
-        a = sanitize_text(ex["final_answer"])
-        r_ocr = sanitize_text(ex.get("provided_reasoning", ""))
-        context_str = r_ocr if len(r_ocr) > 10 else "No context provided."
-
-        if not re.search(r'\d', str(a)) or len(str(a)) > 150: continue
-
-        aug_completion = call_augmentation(q_raw, context_str)
-        if not aug_completion: continue
-        update_cost(MODEL_AUGMENT, aug_completion.usage)
+    # --- 1. Extract Answers (FIXED FOR MULTI-LINE) ---
+    answers_map = {}
+    if "Answers to Selected Exercises" in content:
+        _, answers_section = content.split("Answers to Selected Exercises", 1)
         
-        aug_data = parse_json_response(aug_completion.choices[0].message.content)
-        if not aug_data: continue
-
-        if aug_data.get("status") == "rejected":
-            save_entry({
-                "source_file": filename, "original_question": q_raw,
-                "type": "ghost_rejected_step2",
-                "fail_reason": aug_data.get("rejection_reason")
-            }, False)
-            continue
+        lines = answers_section.split('\n')
         
-        gen_q = fix_latex_artifacts(aug_data.get("augmented_question", ""))
+        current_id = None
+        current_text = []
         
-        if is_ghost_question(gen_q):
-            save_entry({"source_file": filename, "question": gen_q, "fail_reason": "Ghost Question"}, False)
-            continue
-
-        solve_completion = call_solver(gen_q, a)
-        if not solve_completion: continue
-        update_cost(MODEL_REASON, solve_completion.usage)
-
-        solve_data = parse_json_response(solve_completion.choices[0].message.content)
-        if not solve_data: continue
-
-        gen_r = fix_latex_artifacts(solve_data.get("reasoning", ""))
-
-        gen_r = gen_r.replace("Based on the provided values, ", "")
-        gen_r = gen_r.replace("From the provided context, ", "")
-        gen_r = gen_r.replace("In the provided text, ", "")
-        gen_r = gen_r.strip()
-
-        accepted = True
-        fail_reason = None
-
-        if is_discrepancy(gen_r):
-            accepted = False
-            fail_reason = "Discrepancy"
-        elif is_context_leak(gen_r):
-            accepted = False
-            fail_reason = "Leak"
-        elif is_tautology(gen_q, a):
-            accepted = False
-            fail_reason = "Tautology"
-        elif len(gen_r) < 50 and not any(x in gen_r for x in ['\\', '=', '+', '*', '/', '>', '<', '^']):
-            accepted = False
-            fail_reason = "Reasoning too short/no math"
-
-        final_entry = {
-            "source_file": filename,
-            "original_question": q_raw,
-            "question": gen_q,
-            "reasoning": gen_r,
-            "answer": a,
-            "type": "synthetic_3step",
-            "quality_flag": "ok" if accepted else "rejected",
-            "fail_reason": fail_reason
-        }
-        save_entry(final_entry, accepted)
-
-    print(f"{filename} Finished.")
-
-if __name__ == "__main__":
-    files = glob.glob(os.path.join(TEXTBOOKS_FOLDER, "*.md"))
-    done_files = set()
-    for fpath in [OUTPUT_FILE, REJECTED_FILE]:
-        if os.path.exists(fpath):
-            try:
-                with open(fpath, "r", encoding="utf-8") as f:
-                    for line in f:
-                        try: done_files.add(json.loads(line)["source_file"])
-                        except: pass
-            except: pass
+        new_answer_pattern = re.compile(r'^\s*[-*]?\s*(\d+\.\d+)\.?\s+(.*)')
+        
+        for line in lines:
+            line = line.strip()
+            if not line: continue  # Ignore empty lines
             
-    todo = [f for f in files if os.path.basename(f) not in done_files]
-    print(f"{len(todo)} files remaining to process.")
+            match = new_answer_pattern.match(line)
+            
+            if match:
+                if current_id:
+                    answers_map[current_id] = " ".join(current_text).strip()
+                
+                current_id = match.group(1)
+                current_text = [match.group(2).strip()]
+                
+            else:
+                if current_id:
+                    current_text.append(line)
+        
+        # Don't forget to save the very last answer from the loop
+        if current_id:
+            answers_map[current_id] = " ".join(current_text).strip()
+            
+    else:
+        print("Warning: Section 'Answers to Selected Exercises' not found.")
+    
+    raw_blocks = re.split(r'####\s+\*\*EXERCISE', content)
+
+    candidates = []
+    for block in raw_blocks[1:]:
+        match_id = re.match(r'\s+(\d+\.\d+)\*\*(.*)', block, re.DOTALL)
+        if match_id:
+            ex_id = match_id.group(1)
+            raw_text = match_id.group(2).strip()
+            raw_text = raw_text.split('####')[0].strip()
+            raw_text = raw_text.split('### ')[0].strip()
+            clean_q_text = remove_captions_and_noise(raw_text) # Votre fonction de nettoyage
+            if clean_q_text:
+                candidates.append({"id": ex_id, "question": clean_q_text})
+            
+    return candidates, answers_map
+
+def process_item(item, answer_text):
+    q_id = item["id"]
+    q_text = item["question"]  # Already cleaned of captions
+    a_text = answer_text
+    
+    # Clean up spacing for LLM submission
+    q_clean_spaces = clean_spaces(q_text)
+    a_clean_spaces = clean_spaces(a_text)
+    
+    title = f"Problem {q_id}, Reliability Textbook"
+
+    # 1. Syntax filter (Free): Cross-references
+    if has_cross_reference(q_text):
+        return {
+            "status": "rejected_syntax", 
+            "reason": "External reference detected (Example, Figure, Table...)",
+            "q_preview": q_clean_spaces[:100]
+        }
+
+    # 2. LLM call (Paid): Generation + Verification
+    try:
+        response = client.chat.completions.create(
+            model=MODEL_REASON,
+            messages=[{"role": "user", "content": REASONING_PROMPT.format(question=q_clean_spaces, answer=a_clean_spaces)}],
+            response_format={"type": "json_object"},
+            temperature=0.2  # Low temperature for mathematical rigor
+        )
+        
+        # Track cost
+        with stats_lock:
+            u = response.usage
+            # Rough estimation (DeepSeek pricing varies, adjust according to your provider)
+            cost = (u.prompt_tokens/1e6 * 0.35) + (u.completion_tokens/1e6 * 1.40)
+            global_stats["cost"] += cost
+
+        # Parse response
+        content = response.choices[0].message.content
+        result_json = json.loads(content)
+        
+        status = result_json.get("status", "MATCH")
+        reasoning = result_json.get("reasoning", "")
+
+        # 3. Verify LLM verdict
+        if status == "DISCREPANCY_FOUND" or "DISCREPANCY_FOUND" in reasoning:
+             return {
+                 "status": "rejected_discrepancy", 
+                 "reason": "LLM found discrepancy with target answer", 
+                 "llm_output": reasoning,
+                 "id": q_id
+             }
+        
+        # Validate minimum length
+        if len(reasoning) < 20:
+             return {"status": "rejected_discrepancy", "reason": "Reasoning too short/empty", "id": q_id}
+
+        # SUCCESS: Return the final object
+        # Note: We return the original text (clean_spaces) to maintain integrity
+        return {
+            "status": "success",
+            "data": {
+                "title": title,
+                "question": q_clean_spaces,
+                "reasoning": reasoning,
+                "answer": a_clean_spaces
+            }
+        }
+
+    except Exception as e:
+        return {"status": "error", "reason": str(e), "id": q_id}
+
+
+def main():
+    # Initial cleanup of output files
+    if os.path.exists(OUTPUT_FILE): os.remove(OUTPUT_FILE)
+    if os.path.exists(REJECTED_FILE): os.remove(REJECTED_FILE)
+
+    print(">>> 1. Parsing the Textbook...")
+    questions, answers_map = parse_textbook(INPUT_FILE)
+    
+    # Create valid pairs (Exercises that have both a question and an answer)
+    pairs = []
+    for q in questions:
+        if q["id"] in answers_map:
+            pairs.append((q, answers_map[q["id"]]))
+    
+    print(f">>> {len(pairs)} candidate exercises found (with answers).")
+    print(">>> 2. Starting processing...")
 
     with ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
-        futures = {executor.submit(process_single_file, f): f for f in todo}
-        for future in as_completed(futures):
-            try: future.result()
-            except Exception as e: print(f"Crash: {e}")
+        # Submit tasks
+        futures = {executor.submit(process_item, p[0], p[1]): p[0]["id"] for p in pairs}
 
-    print("finished")
-    print(f"Total valid: {global_stats['saved_items']} | Cost: ${global_stats['total_cost']:.4f}")
+        for future in as_completed(futures):
+            q_id = futures[future]
+            try:
+                res = future.result()
+                
+                # --- SUCCESS CASE ---
+                if res["status"] == "success":
+                    with file_lock:
+                        with open(OUTPUT_FILE, "a", encoding="utf-8") as f:
+                            f.write(json.dumps(res["data"]) + "\n")
+                        global_stats["processed"] += 1
+                    print(f"[OK] {q_id}")
+
+                # --- REJECTION CASE (Syntax or Discrepancy) ---
+                elif "rejected" in res["status"]:
+                    with file_lock:
+                        with open(REJECTED_FILE, "a", encoding="utf-8") as f:
+                            # Detailed log for debugging
+                            log_entry = {
+                                "id": q_id, 
+                                "status": res["status"],
+                                "reason": res.get("reason"),
+                                "llm_output": res.get("llm_output", "N/A")
+                            }
+                            f.write(json.dumps(log_entry) + "\n")
+                        
+                        if res["status"] == "rejected_syntax": 
+                            global_stats["rejected_syntax"] += 1
+                        else: 
+                            global_stats["rejected_discrepancy"] += 1
+                    
+                    # Show fewer details for Syntax (very common) than for Discrepancy
+                    if res["status"] == "rejected_syntax":
+                        print(f"[SKIP-SYNTAX] {q_id}")
+                    else:
+                        print(f"[SKIP-MATH] {q_id} : Discrepancy found")
+
+                # --- API ERROR CASE ---
+                elif res["status"] == "error":
+                    print(f"[ERROR] {q_id} : {res.get('reason')}")
+
+            except Exception as e:
+                print(f"[CRASH] {q_id} : {e}")
+
+    print("\n" + "="*40)
+    print("PROCESSING COMPLETED")
+    print("="*40)
+    print(f"Final Dataset   : {global_stats['processed']} items (Saved in {OUTPUT_FILE})")
+    print(f"Syntax Rejection: {global_stats['rejected_syntax']} items (Ghost questions, refs missing)")
+    print(f"Math/LLM Rejection: {global_stats['rejected_discrepancy']} items (Wrong answers, contradictions)")
+    print(f"Estimated Cost  : ${global_stats['cost']:.4f}")
+    print("="*40)
+
+if __name__ == "__main__":
+    main()
